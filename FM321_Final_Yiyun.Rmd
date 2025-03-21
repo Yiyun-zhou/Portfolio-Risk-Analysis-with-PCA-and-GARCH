@@ -1,0 +1,250 @@
+# Import relevant packages
+```{r}
+library(rmgarch) #GARCH model
+library(rugarch)
+library(BEKKs) #Multivariate Conditional Volatility Model
+library(quantmod)
+library(tidyverse)
+library(PerformanceAnalytics)
+library(timeSeries) 
+library(tseries) #time series model
+library(roll)
+library(car)
+library(MASS)
+library(extraDistr)
+library(QRM)
+library(dplyr)
+library(rmarkdown)
+```
+
+# Data Preprocessing
+```{r}
+rm(list=ls())
+
+#define get_returns function
+get_returns = function(tickers, stocks){
+  ENV.CW5 = new.env()
+  symbols = getSymbols(tickers ,from='2010-01-04', to='2019-12-31', env = ENV.CW5) 
+  #get price data from yahoo finance
+  price = do.call(merge, eapply(ENV.CW5, Ad))
+  names(price) = stocks
+  #use de-mean log returns for analysis
+  log_returns = diff(log(price))
+  log_returns = na.omit(log_returns)
+  log_returns_demean = sweep(log_returns, MARGIN = 2, STATS = colMeans(log_returns))
+  
+  return(log_returns_demean)
+}
+
+#define tickers and stocks desired
+tickers = c('META', 'AMZN', 'AAPL', 'GOOG', 'V', 'JNJ')
+stocks = c('FB', 'Amazon', 'Apple', 'Alphabet', 'Visa', 'J&J')
+
+data = get_returns(tickers, stocks)
+```
+
+# PCA Analysis
+```{r}
+#run PCA on log return data
+PCA <- prcomp(x = data)
+Table_PCA <- rbind(PCA$rotation, summary(PCA)$importance)
+
+#output a table
+knitr::kable(Table_PCA, digits=4, align = 'c', 'simple')
+```
+
+## PC univariate models - GARCH(1,1)
+```{r}
+nf <- 4 # number of principal components used
+f <- PCA$x
+
+#GARCH(1,1) for each PCs
+GARCH_1_1 <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), mean.model = list(armaOrder = c(0, 0), include.mean = FALSE))
+uspec <- multispec(replicate(nf, GARCH_1_1)) #multispec takes multiple univariate garch and combines to a mutivariate garch model
+
+GARCH_multifit <- multifit(multispec = uspec, data = f[,1:nf], solver = 'hybrid')
+
+sigma <- sigma(GARCH_multifit) #sigma_t for each GARCH
+htMat <- xts(sigma^2, order.by = index(data))
+
+errors <- data - f[, 1:nf] %*% t(PCA$rotation[,1:nf]) #residuals, PCA$rotation is the matrix of eigenvectors, the second element reconstructs the data using first 4 principal components （t(W)*x)
+omega <- diag(colMeans(errors^2)) #residual variance
+ht <- array(dim = c(length(stocks), length(stocks), dim(data)[1]))
+for (i in 1:dim(data)[1]) {
+  ht[, , i] <- PCA$rotation[,1:nf] %*% diag(as.numeric(htMat[i, ])) %*% t(PCA$rotation[,1:nf]) + omega
+} #ht[, , i] is the conditional variance covariance matrix for six stocks for i-th day, which equals the conditional variance of the PC part (first element) + variance of residuals
+```
+
+### Prediction on 2020-01-02
+```{r}
+#run forecast for each PCs under GARCH: first fit, then predict
+garch_f1_fit <- ugarchfit(GARCH_1_1, data = f[,1], solver = 'hybrid')
+garch_f2_fit <- ugarchfit(GARCH_1_1, data = f[,2], solver = 'hybrid')
+garch_f3_fit <- ugarchfit(GARCH_1_1, data = f[,3], solver = 'hybrid')
+garch_f4_fit <- ugarchfit(GARCH_1_1, data = f[,4], solver = 'hybrid')
+
+garch_pred_f1 = ugarchforecast(garch_f1_fit, n.ahead = 1)
+garch_pred_f2 = ugarchforecast(garch_f2_fit, n.ahead = 1)
+garch_pred_f3 = ugarchforecast(garch_f3_fit, n.ahead = 1)
+garch_pred_f4 = ugarchforecast(garch_f4_fit, n.ahead = 1)
+
+garch_pred_f1_sigma = garch_pred_f1@forecast$sigmaFor
+garch_pred_f2_sigma = garch_pred_f2@forecast$sigmaFor
+garch_pred_f3_sigma = garch_pred_f3@forecast$sigmaFor
+garch_pred_f4_sigma = garch_pred_f4@forecast$sigmaFor
+
+#use last day's var matrix to predict the second-day stock var by applying the weights
+portfolio_var_pred = 
+  (summary(PCA)$importance[2,1]*garch_pred_f1_sigma)^2 + (summary(PCA)$importance[2,2]*garch_pred_f2_sigma)^2 + 
+  (summary(PCA)$importance[2,3]*garch_pred_f3_sigma)^2 + (summary(PCA)$importance[2,4]*garch_pred_f4_sigma)^2
+portfolio_sigma_pred = sqrt(portfolio_var_pred)
+portfolio_sigma_pred
+
+```
+
+
+# VaR Analysis
+## Parametric Approach
+```{r}
+p1 = 0.05
+VaRt <- - qnorm(p1) * portfolio_sigma_pred 
+#assuming standardized returns are normally distributed
+VaRt
+```
+
+
+## Rolling prediction
+```{r}
+Ts <- length(index(data))
+WE <- 5 / p1 # estimation window length
+
+# rolling prediction for each PCs
+roll_pred_f1 = ugarchroll(GARCH_1_1, data = f[,1], n.ahead = 1, forecast.length = (Ts-WE), window.size = WE)
+roll_pred_f2 = ugarchroll(GARCH_1_1, data = f[,2], n.ahead = 1, forecast.length = (Ts-WE), window.size = WE)
+roll_pred_f3 = ugarchroll(GARCH_1_1, data = f[,3], n.ahead = 1, forecast.length = (Ts-WE), window.size = WE)
+roll_pred_f4 = ugarchroll(GARCH_1_1, data = f[,4], n.ahead = 1, forecast.length = (Ts-WE), window.size = WE)
+
+#Portfolio variance calculated as same above (weighted PC rolling var)
+portfolio_var_rollpred =  
+  (summary(PCA)$importance[2,1]*roll_pred_f1@forecast$density$Sigma)^2 +  (summary(PCA)$importance[2,2]*roll_pred_f2@forecast$density$Sigma)^2 + 
+  (summary(PCA)$importance[2,3]*roll_pred_f3@forecast$density$Sigma)^2 +
+  (summary(PCA)$importance[2,4]*roll_pred_f4@forecast$density$Sigma)^2
+
+#Portfolio VaR from rolling predictions
+portfolio_VaR_rollpred = - qnorm(p1) * sqrt(portfolio_var_rollpred)
+
+VaR_HS <- xts(matrix(nrow = Ts, ncol = 1), order.by = index(data))
+
+#for the first WE VaR, sigma used from GARCH estimates
+for (i in 1:WE){
+  VaR_HS[i] = - qnorm(p1) * (  
+    (summary(PCA)$importance[2,1]*sigma[i,1])^2 + (summary(PCA)$importance[2,2]*sigma[i,2])^2 + 
+    (summary(PCA)$importance[2,3]*sigma[i,3])^2 + (summary(PCA)$importance[2,4]*sigma[i,4])^2)
+}
+for (i in WE+1:Ts){
+  VaR_HS[i] = portfolio_VaR_rollpred[i-WE]
+} # Error sometimes occurs, but have checked no data is lost
+
+VaR_HS <- lag(VaR_HS, k = 1, na.pad = TRUE)
+
+```
+
+### Portfolio Returns
+```{r}
+portfolio_ret = xts(matrix(nrow = Ts), ncol = 1, order.by = index(data)) 
+
+for (i in 1:dim(data)[1]){
+  portfolio_ret[i] = 1/6 * sum(data[i,])
+}
+
+portfolio_ret_demean = portfolio_ret - mean(portfolio_ret)
+```
+
+## Backtest on VaR
+```{r}
+WT <- Ts - WE
+ra <- portfolio_ret_demean[(WE + 1):Ts]
+VaRa <- VaR_HS[(WE + 1):Ts]
+eta <- ra < - VaRa # hit sequence
+v1 <- sum(eta) # sum of violations
+v0 <- length(eta) - v1 # sum of non-violations
+EV <- p1*WT # expected number of violations
+
+print(paste('Number of HS violations is',v1)) 
+print(paste('Number of no violations is',v0))
+print(paste('Expected number of violations is',EV))
+
+VR = v1 / EV # observed number of violations/expected number of violations 
+print(paste('Violation ratio',VR))
+
+if (v1 > EV) {
+  print('You have underforecasted VaR')
+} else {
+  print('You have overforecasted VaR')
+}
+```
+
+### Unconditional Coverage Test
+```{r}
+picap <- v1 / (v1 + v0)
+
+a <- (1 - p1)^v0 * p1^v1 # likelihood of restricted model
+b <- (1 - picap)^v0 * picap^v1 # likelihood of unrestricted model
+
+LR <- 2 * (log(b / a))
+if (LR > qchisq(p = 1 - p1, df = 1)) {
+  print('Null hypothesis H0 is rejected')
+} else {
+  print('We cannot reject the null')
+} 
+# The violations are not happening with expected frequency
+```
+
+### Conditional Coverage Test
+```{r}
+logical <- matrix(nrow = WT, ncol = 4)
+
+for (i in 2:WT) {
+  logical[i,1] <- coredata(eta)[i-1] == 0 & coredata(eta)[i] == 0
+  logical[i,2] <- coredata(eta)[i-1] == 0 & coredata(eta)[i] == 1
+  logical[i,3] <- coredata(eta)[i-1] == 1 & coredata(eta)[i] == 0
+  logical[i,4] <- coredata(eta)[i-1] == 1 & coredata(eta)[i] == 1
+}
+
+eta_00 = sum(logical[, 1], na.rm = TRUE)
+eta_01 = sum(logical[, 2], na.rm = TRUE)
+eta_10 = sum(logical[, 3], na.rm = TRUE)
+eta_11 = sum(logical[, 4], na.rm = TRUE)
+
+P_00 = eta_00 / (eta_00 + eta_01)
+P_01 = eta_01 / (eta_00 + eta_01)
+P_10 = eta_10 / (eta_10 + eta_11)
+P_11 = eta_11 / (eta_10 + eta_11)
+
+hat_p = (eta_01 + eta_11) / (eta_00 + eta_01 + eta_10 + eta_11)
+
+b1 = P_00^(eta_00) * P_01^(eta_01) * P_10^(eta_10) * P_11^(eta_11)
+a1 = (1 - hat_p)^(eta_00 + eta_10) * hat_p^(eta_01 + eta_11)
+
+LR1 = 2 * log(b1 / a1)   
+
+if (LR1 > qchisq(p = 1 - p1, df = 1)) {
+  print('Null hypothesis H0 is rejected')
+} else {
+  print('We cannot reject the null')
+}
+# Violations are happening independently
+```
+
+## Plot - VaR and Return
+```{r}
+plot(x = index(ra), y = ra, ylab = "VaR/Returns", lwd = 1,
+       xlab = "Date", type = "l", col = "red")
+  lines(x = index(ra), y = -VaRa , col = "blue", lwd = 3)
+  legend("bottomleft", legend = c('Returns', 'VaR'), lty = 1, col = c("red", "blue"))
+```
+
+
+
+
+
